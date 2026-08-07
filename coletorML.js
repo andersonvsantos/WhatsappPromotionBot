@@ -6,20 +6,33 @@ const cheerio = require('cheerio');
 // ==========================================
 const MEU_TAG_AFILIADO = process.env.ML_AFFILIATE_TAG || 'vean5438384';
 const API_LOCAL_URL = 'http://127.0.0.1:3000/ofertas';
-const QTD_PRODUTOS_POR_BUSCA = 30; // Limite total de produtos por rodada
-const PRODUTOS_POR_CATEGORIA = 2;  // Troca de categoria a cada 2 produtos
-const INTERVALO_MINUTOS = 30;     // Tempo entre cada verificação automática
+const QTD_PRODUTOS_POR_BUSCA = 10; // Limite total de produtos por rodada
+const PRODUTOS_POR_CATEGORIA = 1;  // Troca de categoria a cada produto
+const INTERVALO_MINUTOS = 50;     // Tempo entre cada verificação automática
 
 // Conjunto para controle de duplicados em memória (evita reenviar o mesmo item)
 const linksEnviados = new Set();
 
 // Páginas de ofertas/promoções do Mercado Livre
 const URLS_OFERTAS = [
-    'https://www.mercadolivre.com.br/ofertas',
-    'https://www.mercadolivre.com.br/ofertas?category=MLB1051', // Informática
-    'https://www.mercadolivre.com.br/ofertas?category=MLB1055', // Celulares
-    'https://www.mercadolivre.com.br/ofertas?category=MLB5726', // Eletrodomésticos
-    'https://www.mercadolivre.com.br/ofertas?category=MLB1499'  // Fitness / Esportes
+  'https://www.mercadolivre.com.br/ofertas',
+
+  // Tecnologia
+  'https://www.mercadolivre.com.br/ofertas?category=MLB1055', // Celulares
+  'https://www.mercadolivre.com.br/ofertas?category=MLB1051', // Informática
+  'https://www.mercadolivre.com.br/ofertas?category=MLB1144', // Games
+
+  // Casa
+  'https://www.mercadolivre.com.br/ofertas?category=MLB5726', // Eletrodomésticos
+  'https://www.mercadolivre.com.br/ofertas?category=MLB1574', // Casa e Decoração
+
+  // Consumo recorrente
+  'https://www.mercadolivre.com.br/ofertas?category=MLB1246', // Beleza
+  'https://www.mercadolivre.com.br/ofertas?category=MLB1499', // Esportes
+
+  // Ticket alto
+  'https://www.mercadolivre.com.br/ofertas?category=MLB1743', // Auto Peças
+  'https://www.mercadolivre.com.br/ofertas?category=MLB1648', // Ferramentas
 ];
 
 function gerarLinkAfiliado(permalink) {
@@ -69,12 +82,17 @@ async function rasparCategoria(url) {
             const precoPorText = $(element).find('.andromeda-price__fraction, .poly-price__current .andes-money-amount__fraction').first().text().trim();
             const precoDeText = $(element).find('.andes-money-amount--previous .andes-money-amount__fraction').first().text().trim();
 
+            // Captura da imagem com fallback para atributos de lazy loading
+            const imgElement = $(element).find('img').first();
+            const imagemUrl = imgElement.attr('data-src') || imgElement.attr('src') || imgElement.attr('data-lazy') || null;
+
             if (titulo && link && precoPorText) {
                 produtosRaspados.push({
                     titulo,
                     link,
                     precoPor: precoPorText,
-                    precoDe: precoDeText || null
+                    precoDe: precoDeText || null,
+                    imagemUrl: imagemUrl
                 });
             }
         });
@@ -105,7 +123,7 @@ async function buscarOfertasML() {
             p => !linksEnviados.has(p.link) && !loteParaEnviar.some(item => item.link === p.link)
         );
 
-        // Seleciona até 2 produtos desta categoria
+        // Seleciona produtos desta categoria conforme limite
         const selecionados = produtosNovos.slice(0, PRODUTOS_POR_CATEGORIA);
 
         if (selecionados.length > 0) {
@@ -140,7 +158,8 @@ async function buscarOfertasML() {
             precoDe: precoDeNum.toFixed(2).replace('.', ','),
             precoPor: precoPorNum.toFixed(2).replace('.', ','),
             cupom: null,
-            link: gerarLinkAfiliado(produto.link)
+            link: gerarLinkAfiliado(produto.link),
+            imagemUrl: produto.imagemUrl
         };
 
         try {
@@ -176,7 +195,7 @@ async function buscarOfertasML() {
 }
 
 /**
- * Inicializador e Agendador Continuo
+ * Inicializador e Agendador Contínuo
  */
 function iniciarColetorAutomatico() {
     console.log(`🚀 [Coletor ML] Iniciado em modo contínuo!`);

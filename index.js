@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const express = require('express');
@@ -12,6 +12,7 @@ const { Ollama } = require('ollama');
 const PORT = 3000;
 const OLLAMA_MODEL = 'llama3.2:3b';
 const IA_COOLDOWN_MS = 5 * 1000;
+const OLLAMA_TIMEOUT_MS = 15 * 1000;
 let isReady = false;
 let targetGroupIds = [];
 let targetGroupName = null;
@@ -131,6 +132,24 @@ function carregarGruposDoEnv() {
     return targetGroupIds;
 }
 
+function withTimeout(promise, ms, fallbackValue) {
+    let timeoutId;
+    const timeoutPromise = new Promise((resolve) => {
+        timeoutId = setTimeout(() => {
+            console.warn(`⏱️ Tempo limite de ${ms}ms excedido na chamada.`);
+            resolve(fallbackValue);
+        }, ms);
+    });
+
+    return Promise.race([
+        promise.then((res) => {
+            clearTimeout(timeoutId);
+            return res;
+        }),
+        timeoutPromise
+    ]);
+}
+
 carregarVariaveisDoEnv();
 carregarGruposDoEnv();
 
@@ -172,40 +191,40 @@ function getHorarioAtual() {
 }
 
 function eHorarioPermitido() {
-    const horaStr = new Date().toLocaleTimeString('pt-BR', { 
-        timeZone: 'America/Sao_Paulo', 
-        hour: '2-digit', 
-        hour12: false 
-    });
-    const hora = parseInt(horaStr, 10);
-    return hora >= 8 && hora < 23;
+    try {
+        const horaStr = new Date().toLocaleTimeString('pt-BR', { 
+            timeZone: 'America/Sao_Paulo', 
+            hour: '2-digit', 
+            hourCycle: 'h23'
+        });
+        const hora = parseInt(horaStr.replace(/\D/g, ''), 10);
+        if (isNaN(hora)) return true;
+        return hora >= 8 && hora < 23;
+    } catch {
+        return true;
+    }
 }
 
-/**
- * Filtro de curadoria focado em utilidade e apelo comercial (aceita achadinhos e produtos de baixo custo).
- */
 async function curarOfertaComIA(oferta) {
     try {
         const systemPrompt = `Você é um curador para um grupo geral de promoções e achadinhos no WhatsApp.
-Seu objetivo é APROVAR produtos de uso pessoal, tecnologia, casa, eletrodomésticos, acessórios e ofertas baratas atrativas ("achadinhos").
-
-REGRA DE PREÇO: Produtos de baixo valor/baratinhos DEVEM SER APROVADOS se forem itens úteis do dia a dia (ex: cabos, carregadores, fones, organizadores, ferramentas manuais, utilidades domésticas).
+Seu objetivo é APROVAR produtos de uso pessoal, higiene, beleza, cosméticos, suplementos, tecnologia, casa, eletrodomésticos, acessórios e ofertas baratas atrativas ("achadinhos").
 
 CRITÉRIOS RÍGIDOS DE REJEIÇÃO (aprovar = false):
-1. Insumos estritamente médicos ou hospitalares (seringas, luvas cirúrgicas, agulhas, móveis hospitalares).
+1. Insumos estritamente hospitalares, clínicos ou médicos cirúrgicos.
 2. Embalagens de mudança em lote ou caixas de papelão vazias.
-3. Peças puramente industriais ou mecânicas (parafusos soltos, engrenagens, conexões de esgoto, maquinário pesado).
+3. Peças puramente industriais ou mecânicas.
 4. Peças genéricas para modelos específicos muito antigos/incomuns.
 
 FORMATO OBRIGATÓRIO DE SAÍDA:
 Retorne APENAS um JSON válido no formato:
-{"aprovar": false, "motivo": "Insumo médico sem apelo comercial geral."}
+{"aprovar": false, "motivo": "Insumo hospitalar sem apelo comercial geral."}
 ou
 {"aprovar": true, "motivo": "Produto útil de boa procura ou achadinho em conta."}`;
 
         const userPrompt = `Analise este produto: "${oferta.titulo}" | Preço: R$ ${oferta.precoPor}`;
 
-        const response = await ollama.chat({
+        const ollamaPromise = ollama.chat({
             model: OLLAMA_MODEL,
             messages: [
                 { role: 'system', content: systemPrompt },
@@ -216,6 +235,9 @@ ou
                 num_predict: 80
             }
         });
+
+        const fallback = { message: { content: '{"aprovar": true, "motivo": "Aprovado por padrão devido ao timeout da IA."}' } };
+        const response = await withTimeout(ollamaPromise, OLLAMA_TIMEOUT_MS, fallback);
 
         if (response?.message?.content) {
             const rawContent = response.message.content.trim();
@@ -236,35 +258,6 @@ ou
     }
 }
 
-/**
- * Gera um layout dinâmico e variado no fallback para evitar repetições quando a IA falhar
- */
-function gerarLayoutPadrao(oferta) {
-    const aberturas = [
-        "🔥 *OFERTA IMPERDÍVEL!*",
-        "💥 *OLHA ESSA PROMOÇÃO!*",
-        "⚡ *BAIXOU O PREÇO!*",
-        "🚀 *DESTAQUE DO DIA!*",
-        "👀 *ACHADINHO EM CONTA!*"
-    ];
-    const aberturaSorteada = aberturas[Math.floor(Math.random() * aberturas.length)];
-
-    let msg = `${aberturaSorteada}\n\n`;
-    msg += `📦 *${oferta.titulo}*\n`;
-    if (oferta.precoDe) msg += `De: ~R$ ${oferta.precoDe}~\n`;
-    msg += `Por apenas: *R$ ${oferta.precoPor}*\n`;
-    if (oferta.cupom) msg += `🎟️ Cupom: *${oferta.cupom}*\n`;
-    msg += `\n👉 Compre agora: ${oferta.link}`;
-    
-    return msg;
-}
-
-/**
- * Gera mensagens totalmente variadas usando IA
- */
-/**
- * Gera a frase de abertura via IA e monta o corpo da oferta via JavaScript para garantir 100% de integridade.
- */
 async function gerarMensagemComIA(oferta) {
     let fraseAbertura = '';
 
@@ -295,7 +288,7 @@ REGRAS RÍGIDAS:
 
             const userPrompt = `Gere uma frase de abertura variada para divulgar o produto: ${oferta.titulo}`;
 
-            const response = await ollama.chat({
+            const ollamaPromise = ollama.chat({
                 model: OLLAMA_MODEL,
                 messages: [
                     { role: 'system', content: systemPrompt },
@@ -307,6 +300,8 @@ REGRAS RÍGIDAS:
                 }
             });
 
+            const response = await withTimeout(ollamaPromise, OLLAMA_TIMEOUT_MS, null);
+
             if (response?.message?.content) {
                 fraseAbertura = response.message.content.trim().replace(/^["'\s]+|["'\s]+$/g, '');
             }
@@ -316,7 +311,6 @@ REGRAS RÍGIDAS:
         }
     }
 
-    // Se a IA falhar, estiver em cooldown ou retornar vazio, sorteia uma frase em JS
     if (!fraseAbertura) {
         const fallbacks = [
             '🔥 *OFERTA IMPERDÍVEL!*',
@@ -328,7 +322,6 @@ REGRAS RÍGIDAS:
         fraseAbertura = fallbacks[Math.floor(Math.random() * fallbacks.length)];
     }
 
-    // Montagem 100% segura via código (garante que nada do produto seja cortado)
     let msg = `${fraseAbertura}\n\n`;
     msg += `📦 *${oferta.titulo}*\n`;
     if (oferta.precoDe) msg += `De: ~R$ ${oferta.precoDe}~\n`;
@@ -367,10 +360,36 @@ async function iniciarLoopDeEnvio() {
 
                 for (const targetGroupId of targetGroupIds) {
                     try {
-                        await client.sendMessage(targetGroupId, mensagem);
-                        console.log(`[${getHorarioAtual()}] ✅ Oferta enviada para ${targetGroupId}`);
+                        let enviadoComImagem = false;
+
+                        // Tenta baixar e enviar a imagem se houver uma URL disponível
+                        if (oferta.imagemUrl) {
+                            try {
+                                const media = await MessageMedia.fromUrl(oferta.imagemUrl, { unsafeMime: true });
+                                await client.sendMessage(targetGroupId, media, { caption: mensagem });
+                                enviadoComImagem = true;
+                                console.log(`[${getHorarioAtual()}] 🖼️ Oferta com imagem enviada para ${targetGroupId}`);
+                            } catch (imgError) {
+                                console.warn(`⚠️ Falha ao carregar mídia (${oferta.imagemUrl}). Enviando apenas texto...`, imgError.message);
+                            }
+                        }
+
+                        // Fallback: se não tiver imagem ou falhar o envio da mídia, envia texto puro
+                        if (!enviadoComImagem) {
+                            await client.sendMessage(targetGroupId, mensagem, { linkPreview: true });
+                            console.log(`[${getHorarioAtual()}] ✅ Oferta em texto enviada para ${targetGroupId}`);
+                        }
+
                     } catch (error) {
                         console.warn(`⚠️ Falha ao enviar para ${targetGroupId}:`, error.message || error);
+                        if (error.message && error.message.includes('detached Frame')) {
+                            console.error('🚨 Detectado erro de frame desanexado no Puppeteer. Reiniciando a página...');
+                            try {
+                                if (client.pupPage) await client.pupPage.reload();
+                            } catch (e) {
+                                logError('puppeteer.reload', e);
+                            }
+                        }
                     }
                 }
 
@@ -464,13 +483,21 @@ app.post('/set-grupo', checkValidBody, (req, res) => {
 
 app.post('/ofertas', checkValidBody, async (req, res) => {
     try {
-        const { titulo, precoPor, precoDe, cupom, link } = req.body;
+        const { titulo, precoPor, precoDe, cupom, link, imagemUrl, imagem } = req.body;
 
         if (!titulo || !precoPor || !link) {
             return res.status(400).json(buildErrorPayload('Os campos "titulo", "precoPor" e "link" são obrigatórios.', new Error('payload inválido')));
         }
 
-        const novaOferta = { titulo, precoPor, precoDe, cupom, link, adicionadoEm: new Date() };
+        const novaOferta = { 
+            titulo, 
+            precoPor, 
+            precoDe, 
+            cupom, 
+            link, 
+            imagemUrl: imagemUrl || imagem || null, 
+            adicionadoEm: new Date() 
+        };
 
         const analise = await curarOfertaComIA(novaOferta);
 
