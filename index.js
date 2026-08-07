@@ -13,7 +13,7 @@ const PORT = 3000;
 const OLLAMA_MODEL = 'llama3.2:3b'; // Model de 3B para chamadas coerentes e bem formatadas
 const IA_COOLDOWN_MS = 5 * 1000;
 let isReady = false;
-let targetGroupId = null;   // ID do grupo selecionado para ofertas
+let targetGroupIds = [];
 let targetGroupName = null; // Nome do grupo selecionado para ofertas
 let currentQrBase64 = null; // QR Code em Base64 para exibir na rota /qr
 let server = null;
@@ -21,38 +21,9 @@ let shuttingDown = false;
 let loopStopRequested = false;
 let lastIACallAt = 0;
 
-function carregarVariaveisDoEnv() {
-    const arquivoEnv = path.join(__dirname, '.env');
-    if (!fs.existsSync(arquivoEnv)) return;
-
-    const conteudo = fs.readFileSync(arquivoEnv, 'utf8');
-    for (const linha of conteudo.split(/\r?\n/)) {
-        const texto = linha.trim();
-        if (!texto || texto.startsWith('#')) continue;
-
-        const separador = texto.indexOf('=');
-        if (separador === -1) continue;
-
-        const chave = texto.slice(0, separador).trim();
-        let valor = texto.slice(separador + 1).trim();
-
-        if ((valor.startsWith('"') && valor.endsWith('"')) || (valor.startsWith("'") && valor.endsWith("'"))) {
-            valor = valor.slice(1, -1);
-        }
-
-        process.env[chave] = valor;
-    }
-}
-
-carregarVariaveisDoEnv();
-
-// Instancia o cliente do Ollama conectando à instância local
-const ollama = new Ollama({ host: 'http://127.0.0.1:11434' });
-
-// Fila em memória para armazenar as ofertas pendentes
-const ofertasQueue = [];
-
-const app = express();
+// ==========================================
+// FUNÇÕES AUXILIARES DE TRATAMENTO E AMBIENTE
+// ==========================================
 
 function formatErrorForLog(context, error, extra = {}) {
     const normalizedError = error instanceof Error ? error : new Error(String(error));
@@ -97,6 +68,80 @@ function isChatTargetCompatible(chatOrId) {
 
     return false;
 }
+
+function normalizeTargetGroupIds(value) {
+    if (!value) return [];
+
+    const rawValues = Array.isArray(value) ? value : [value];
+    const normalized = [];
+
+    for (const item of rawValues) {
+        if (typeof item !== 'string') continue;
+
+        const cleaned = item.toString().trim();
+        if (!cleaned) continue;
+
+        const parts = cleaned
+            .replace(/\[|\]/g, '')
+            .split(/[,;]+/)
+            .map(part => part.trim())
+            .filter(Boolean);
+
+        for (const part of parts) {
+            if (part.endsWith('@g.us') || part.endsWith('@broadcast') || part.endsWith('@newsletter')) {
+                normalized.push(part);
+            }
+        }
+    }
+
+    return [...new Set(normalized)];
+}
+
+function mergeTargetGroupIds(existingIds = [], incomingIds = []) {
+    return [...new Set([...(existingIds || []), ...(incomingIds || [])])];
+}
+
+function carregarVariaveisDoEnv() {
+    const arquivoEnv = path.join(__dirname, '.env');
+    if (!fs.existsSync(arquivoEnv)) return;
+
+    const conteudo = fs.readFileSync(arquivoEnv, 'utf8');
+    for (const linha of conteudo.split(/\r?\n/)) {
+        const texto = linha.trim();
+        if (!texto || texto.startsWith('#')) continue;
+
+        const separador = texto.indexOf('=');
+        if (separador === -1) continue;
+
+        const chave = texto.slice(0, separador).trim();
+        let valor = texto.slice(separador + 1).trim();
+
+        if ((valor.startsWith('"') && valor.endsWith('"')) || (valor.startsWith("'") && valor.endsWith("'"))) {
+            valor = valor.slice(1, -1);
+        }
+
+        process.env[chave] = valor;
+    }
+}
+
+function carregarGruposDoEnv() {
+    const gruposEnv = process.env.GRUPOS || process.env.GROUPS || '';
+    const ids = normalizeTargetGroupIds(gruposEnv);
+    targetGroupIds = mergeTargetGroupIds(targetGroupIds, ids);
+    return targetGroupIds;
+}
+
+// Inicialização de variáveis do ambiente na ordem correta
+carregarVariaveisDoEnv();
+carregarGruposDoEnv();
+
+// Instancia o cliente do Ollama conectando à instância local
+const ollama = new Ollama({ host: 'http://127.0.0.1:11434' });
+
+// Fila em memória para armazenar as ofertas pendentes
+const ofertasQueue = [];
+
+const app = express();
 
 // Middlewares defensivos para parsing do Body
 app.use(express.json());
@@ -144,7 +189,7 @@ function eHorarioPermitido() {
 }
 
 /**
- * Gera uma chamada focada em qualidade e formata a oferta via Ollama (Local)
+ * Gera uma chamada curta, informal e direta no padrão do WhatsApp
  */
 async function gerarMensagemComIA(oferta) {
     const now = Date.now();
@@ -156,36 +201,26 @@ async function gerarMensagemComIA(oferta) {
     try {
         lastIACallAt = now;
 
-        const systemPrompt = `Você é um divulgador de ofertas direto, moderno e objetivo no WhatsApp.
-Sua missão é criar uma mensagem no formato EXATO abaixo:
+        const systemPrompt = `Você é um divulgador de ofertas no WhatsApp.
+Sua única tarefa é escrever UMA frase bem curta e informal na primeira linha dizendo que o produto é bom, vale a pena ou está no precinho/barato. 
 
-<Frase curta de destaque do produto> 🔥
+Use gírias simples e naturais do dia a dia (ex: "No precinho!", "Preço excelente!", "Vale super a pena!", "Muito barato!", "Tá num preço top!").
 
-📱 *<Nome do Produto>*
-De: ~<Preço De>~
-Por apenas: *<Preço Por>*
-🎟️ Cupom: *<Cupom>*
+FORMATO OBRIGATÓRIO DE SAÍDA:
+<Frase curta e simples do dia a dia> 🔥
 
-👉 Compre agora: <Link>
-
-Exemplos de chamadas para a primeira linha:
-- Celulares/Tech: Celular top de linha com excelente custo-benefício!
-- Roupas masculinas: Cueca extremamente confortável e de alta qualidade pra rapizada!
-- Roupas femininas: Topzinho confortável e estiloso pras meninas!
-- Cozinha/Casa: Potes reforçados e perfeitos pra levar sua marmita!
+📦 *<Nome do Produto>*
+${oferta.precoDe ? 'De: ~R$ ' + oferta.precoDe + '~\n' : ''}Por apenas: *R$ ${oferta.precoPor}*
+${oferta.cupom ? '🎟️ Cupom: *' + oferta.cupom + '*\n' : ''}
+👉 Compre agora: ${oferta.link}
 
 REGRAS RÍGIDAS:
-1. Mantenha exatamente as quebras de linha mostradas no formato.
-2. Destaque o nome do produto, o Preço Por e o Cupom em *negrito*.
-3. Mostre o preço antigo com ~riscado~.
-4. Termine com o link. Não escreva nada depois dele.`;
+1. NÃO explique o que o produto faz e NÃO descreva configurações.
+2. A primeira linha deve ter no máximo 5 a 7 palavras simples e naturais do dia a dia.
+3. NÃO use aspas de forma alguma.
+4. Respeite as quebras de linha e encerre exatamente após o link.`;
 
-        const userPrompt = `Gere a oferta no formato estruturado:
-- Produto: ${oferta.titulo}
-- Preço De: ${oferta.precoDe ? 'R$ ' + oferta.precoDe : ''}
-- Preço Por: R$ ${oferta.precoPor}
-- Cupom: ${oferta.cupom || 'Nenhum'}
-- Link: ${oferta.link}`;
+        const userPrompt = `Produto: ${oferta.titulo}`;
 
         const response = await ollama.chat({
             model: OLLAMA_MODEL,
@@ -194,13 +229,14 @@ REGRAS RÍGIDAS:
                 { role: 'user', content: userPrompt }
             ],
             options: {
-                temperature: 0.4,
-                num_predict: 150
+                temperature: 0.7,
+                num_predict: 160
             }
         });
 
         if (response?.message?.content) {
-            return response.message.content.trim().replace(/^"+|"+$/g, '');
+            let textoLimpo = response.message.content.trim().replace(/^["'\s]+|["'\s]+$/g, '');
+            return textoLimpo;
         }
 
         return gerarLayoutPadrao(oferta);
@@ -231,7 +267,7 @@ async function iniciarLoopDeEnvio() {
 
     while (!loopStopRequested) {
         try {
-            if (isReady && targetGroupId && ofertasQueue.length > 0) {
+            if (isReady && targetGroupIds.length > 0 && ofertasQueue.length > 0) {
 
                 if (!eHorarioPermitido()) {
                     console.log(`[${getHorarioAtual()}] 🌙 Fora do horário comercial (8h-22h). Aguardando 15 minutos...`);
@@ -249,9 +285,16 @@ async function iniciarLoopDeEnvio() {
                 await client.sendPresenceAvailable().catch(() => {});
                 await new Promise(resolve => setTimeout(resolve, 2000));
 
-                // Disparo pelo client
-                await client.sendMessage(targetGroupId, mensagem);
-                console.log(`[${getHorarioAtual()}] ✅ Oferta enviada com sucesso! Restantes na fila: ${ofertasQueue.length}`);
+                for (const targetGroupId of targetGroupIds) {
+                    try {
+                        await client.sendMessage(targetGroupId, mensagem);
+                        console.log(`[${getHorarioAtual()}] ✅ Oferta enviada para ${targetGroupId}`);
+                    } catch (error) {
+                        console.warn(`⚠️ Falha ao enviar para ${targetGroupId}:`, error.message || error);
+                    }
+                }
+
+                console.log(`[${getHorarioAtual()}] ✅ Oferta processada. Restantes na fila: ${ofertasQueue.length}`);
 
                 // Intervalo seguro aleatório (ex: entre 3 e 6 minutos)
                 const delayMs = getTempoAleatorioMs(3, 6);
@@ -309,7 +352,7 @@ app.get('/status', (req, res) => {
     return res.json({
         success: true,
         whatsappConectado: isReady,
-        grupoId: targetGroupId,
+        grupoIds: targetGroupIds,
         grupoNome: targetGroupName || 'Não identificado',
         totalFila: ofertasQueue.length,
         modeloIa: OLLAMA_MODEL
@@ -324,10 +367,16 @@ app.post('/set-grupo', checkValidBody, (req, res) => {
         }
 
         const cleanId = groupId.toString().trim();
-        targetGroupId = cleanId.endsWith('@g.us') ? cleanId : `${cleanId}@g.us`;
+        const normalizedIds = normalizeTargetGroupIds(cleanId);
+        if (normalizedIds.length === 0) {
+            return res.status(400).json(buildErrorPayload('groupId inválido. Envie um ID de grupo ou canal válido.', new Error('groupId inválido')));
+        }
 
-        console.log(`📌 Grupo de destino configurado para: ${targetGroupId}`);
-        return res.json({ success: true, message: 'Grupo configurado com sucesso!', targetGroupId });
+        targetGroupIds = mergeTargetGroupIds(targetGroupIds, normalizedIds);
+        targetGroupName = targetGroupName || 'Grupo Vinculado';
+
+        console.log(`📌 Grupo(s) de destino configurado(s): ${targetGroupIds.join(', ')}`);
+        return res.json({ success: true, message: 'Grupo(s) configurado(s) com sucesso!', targetGroupIds });
     } catch (error) {
         logError('route.set-grupo', error, { body: req.body });
         return res.status(500).json(buildErrorPayload('Erro ao configurar grupo.', error));
@@ -442,21 +491,21 @@ client.on('message_create', async (msg) => {
             const chat = await msg.getChat().catch(() => null);
             const chatId = chat?.id?._serialized || msg.from || msg.to || null;
 
-            if (!chatId || !isChatTargetCompatible(chatId) && !isChatTargetCompatible(chat)) {
+            if (!chatId || (!isChatTargetCompatible(chatId) && !isChatTargetCompatible(chat))) {
                 console.log('⚠️ O comando foi enviado fora de um grupo ou canal de broadcast.');
                 return;
             }
 
-            targetGroupId = chatId;
+            targetGroupIds = mergeTargetGroupIds(targetGroupIds, [chatId]);
             targetGroupName = chat ? chat.name : 'Grupo Vinculado';
 
             console.log('\n======================================');
             console.log(`🎯 ALVO SELECIONADO COM SUCESSO!`);
             console.log(`📌 Nome: ${targetGroupName}`);
-            console.log(`👉 ID: ${targetGroupId}`);
+            console.log(`👉 ID: ${chatId}`);
             console.log('======================================\n');
 
-            await client.sendMessage(targetGroupId, `✅ *Bot de Ofertas Vinculado!*\nAs ofertas serão enviadas neste grupo/canal.`);
+            await client.sendMessage(chatId, `✅ *Bot de Ofertas Vinculado!*\nAs ofertas serão enviadas neste grupo/canal.`);
         } catch (e) {
             console.error('Erro ao vincular grupo via comando:', e.message || e);
         }
@@ -475,6 +524,11 @@ const handleShutdown = async (signal = 'SIGTERM') => {
     console.log(`\n🛑 Recebido ${signal}. Encerrando bot de forma segura...`);
 
     try {
+        if (client) {
+            await client.destroy().catch(() => {});
+            console.log('📱 Instância do WhatsApp encerrada.');
+        }
+
         if (server) {
             await new Promise((resolve, reject) => {
                 server.close((err) => (err ? reject(err) : resolve()));
@@ -519,5 +573,7 @@ if (require.main === module) {
 module.exports = {
     buildErrorPayload,
     formatErrorForLog,
-    isChatTargetCompatible
+    isChatTargetCompatible,
+    normalizeTargetGroupIds,
+    mergeTargetGroupIds
 };
