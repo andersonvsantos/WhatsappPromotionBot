@@ -10,12 +10,12 @@ const { Ollama } = require('ollama');
 // CONFIGURAÇÕES E ESTADO DA APLICAÇÃO
 // ==========================================
 const PORT = 3000;
-const OLLAMA_MODEL = 'llama3.2:3b'; // Model de 3B para chamadas coerentes e bem formatadas
+const OLLAMA_MODEL = 'llama3.2:3b';
 const IA_COOLDOWN_MS = 5 * 1000;
 let isReady = false;
 let targetGroupIds = [];
-let targetGroupName = null; // Nome do grupo selecionado para ofertas
-let currentQrBase64 = null; // QR Code em Base64 para exibir na rota /qr
+let targetGroupName = null;
+let currentQrBase64 = null;
 let server = null;
 let shuttingDown = false;
 let loopStopRequested = false;
@@ -131,23 +131,16 @@ function carregarGruposDoEnv() {
     return targetGroupIds;
 }
 
-// Inicialização de variáveis do ambiente na ordem correta
 carregarVariaveisDoEnv();
 carregarGruposDoEnv();
 
-// Instancia o cliente do Ollama conectando à instância local
 const ollama = new Ollama({ host: 'http://127.0.0.1:11434' });
-
-// Fila em memória para armazenar as ofertas pendentes
 const ofertasQueue = [];
-
 const app = express();
 
-// Middlewares defensivos para parsing do Body
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Configuração do WhatsApp Client
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
@@ -189,38 +182,28 @@ function eHorarioPermitido() {
 }
 
 /**
- * Gera uma chamada curta, informal e direta no padrão do WhatsApp
+ * Filtro de curadoria focado em utilidade e apelo comercial (aceita achadinhos e produtos de baixo custo).
  */
-async function gerarMensagemComIA(oferta) {
-    const now = Date.now();
-    if (now - lastIACallAt < IA_COOLDOWN_MS) {
-        console.log('⏱️ Aguardando cooldown da IA local. Usando layout padrão.');
-        return gerarLayoutPadrao(oferta);
-    }
-
+async function curarOfertaComIA(oferta) {
     try {
-        lastIACallAt = now;
+        const systemPrompt = `Você é um curador para um grupo geral de promoções e achadinhos no WhatsApp.
+Seu objetivo é APROVAR produtos de uso pessoal, tecnologia, casa, eletrodomésticos, acessórios e ofertas baratas atrativas ("achadinhos").
 
-        const systemPrompt = `Você é um divulgador de ofertas no WhatsApp.
-Sua única tarefa é escrever UMA frase bem curta e informal na primeira linha dizendo que o produto é bom, vale a pena ou está no precinho/barato. 
+REGRA DE PREÇO: Produtos de baixo valor/baratinhos DEVEM SER APROVADOS se forem itens úteis do dia a dia (ex: cabos, carregadores, fones, organizadores, ferramentas manuais, utilidades domésticas).
 
-Use gírias simples e naturais do dia a dia (ex: "No precinho!", "Preço excelente!", "Vale super a pena!", "Muito barato!", "Tá num preço top!").
+CRITÉRIOS RÍGIDOS DE REJEIÇÃO (aprovar = false):
+1. Insumos estritamente médicos ou hospitalares (seringas, luvas cirúrgicas, agulhas, móveis hospitalares).
+2. Embalagens de mudança em lote ou caixas de papelão vazias.
+3. Peças puramente industriais ou mecânicas (parafusos soltos, engrenagens, conexões de esgoto, maquinário pesado).
+4. Peças genéricas para modelos específicos muito antigos/incomuns.
 
 FORMATO OBRIGATÓRIO DE SAÍDA:
-<Frase curta e simples do dia a dia> 🔥
+Retorne APENAS um JSON válido no formato:
+{"aprovar": false, "motivo": "Insumo médico sem apelo comercial geral."}
+ou
+{"aprovar": true, "motivo": "Produto útil de boa procura ou achadinho em conta."}`;
 
-📦 *<Nome do Produto>*
-${oferta.precoDe ? 'De: ~R$ ' + oferta.precoDe + '~\n' : ''}Por apenas: *R$ ${oferta.precoPor}*
-${oferta.cupom ? '🎟️ Cupom: *' + oferta.cupom + '*\n' : ''}
-👉 Compre agora: ${oferta.link}
-
-REGRAS RÍGIDAS:
-1. NÃO explique o que o produto faz e NÃO descreva configurações.
-2. A primeira linha deve ter no máximo 5 a 7 palavras simples e naturais do dia a dia.
-3. NÃO use aspas de forma alguma.
-4. Respeite as quebras de linha e encerre exatamente após o link.`;
-
-        const userPrompt = `Produto: ${oferta.titulo}`;
+        const userPrompt = `Analise este produto: "${oferta.titulo}" | Preço: R$ ${oferta.precoPor}`;
 
         const response = await ollama.chat({
             model: OLLAMA_MODEL,
@@ -229,31 +212,130 @@ REGRAS RÍGIDAS:
                 { role: 'user', content: userPrompt }
             ],
             options: {
-                temperature: 0.7,
-                num_predict: 160
+                temperature: 0.1,
+                num_predict: 80
             }
         });
 
         if (response?.message?.content) {
-            let textoLimpo = response.message.content.trim().replace(/^["'\s]+|["'\s]+$/g, '');
-            return textoLimpo;
+            const rawContent = response.message.content.trim();
+            const jsonMatch = rawContent.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                const parsed = JSON.parse(jsonMatch[0]);
+                return {
+                    aprovar: Boolean(parsed.aprovar),
+                    motivo: parsed.motivo || 'Sem justificativa fornecida.'
+                };
+            }
         }
 
-        return gerarLayoutPadrao(oferta);
+        return { aprovar: true, motivo: 'Aprovado por padrão.' };
     } catch (error) {
-        console.warn('⚠️ Ollama local indisponível ou desconectado. Usando layout padrão.');
-        logError('ia.gerarMensagem', error);
-        return gerarLayoutPadrao(oferta);
+        logError('ia.curarOferta', error);
+        return { aprovar: true, motivo: 'Aprovado por padrão devido à indisponibilidade do filtro.' };
     }
 }
 
+/**
+ * Gera um layout dinâmico e variado no fallback para evitar repetições quando a IA falhar
+ */
 function gerarLayoutPadrao(oferta) {
-    let msg = `🔥 *${oferta.titulo.toUpperCase()}*\n\n`;
-    if (oferta.precoDe) msg += ` De: ~R$ ${oferta.precoDe}~\n`;
-    msg += ` Por apenas: *R$ ${oferta.precoPor}*\n\n`;
-    if (oferta.cupom) msg += `🎟️ Cupom: *${oferta.cupom}*\n\n`;
-    msg += `👉 Compre aqui: ${oferta.link}\n\n`;
-    msg += `⚠️ _Preço sujeito a alteração a qualquer momento._`;
+    const aberturas = [
+        "🔥 *OFERTA IMPERDÍVEL!*",
+        "💥 *OLHA ESSA PROMOÇÃO!*",
+        "⚡ *BAIXOU O PREÇO!*",
+        "🚀 *DESTAQUE DO DIA!*",
+        "👀 *ACHADINHO EM CONTA!*"
+    ];
+    const aberturaSorteada = aberturas[Math.floor(Math.random() * aberturas.length)];
+
+    let msg = `${aberturaSorteada}\n\n`;
+    msg += `📦 *${oferta.titulo}*\n`;
+    if (oferta.precoDe) msg += `De: ~R$ ${oferta.precoDe}~\n`;
+    msg += `Por apenas: *R$ ${oferta.precoPor}*\n`;
+    if (oferta.cupom) msg += `🎟️ Cupom: *${oferta.cupom}*\n`;
+    msg += `\n👉 Compre agora: ${oferta.link}`;
+    
+    return msg;
+}
+
+/**
+ * Gera mensagens totalmente variadas usando IA
+ */
+/**
+ * Gera a frase de abertura via IA e monta o corpo da oferta via JavaScript para garantir 100% de integridade.
+ */
+async function gerarMensagemComIA(oferta) {
+    let fraseAbertura = '';
+
+    const now = Date.now();
+    if (now - lastIACallAt >= IA_COOLDOWN_MS) {
+        try {
+            lastIACallAt = now;
+
+            const exemplos = [
+                'No precinho!',
+                'Olha essa oferta!',
+                'Preço sensacional!',
+                'Oportunidade imbatível!',
+                'Vale super a pena!',
+                'Baixou demais!',
+                'Achado do dia!'
+            ];
+            const exemploSorteado = exemplos[Math.floor(Math.random() * exemplos.length)];
+
+            const systemPrompt = `Você é um gerador de frases de abertura para promoções no WhatsApp.
+Sua ÚNICA tarefa é criar UMA frase curta e empolgante de no máximo 5 palavras acompanhada de 1 emoji no final.
+
+REGRAS RÍGIDAS:
+1. Responda APENAS a frase e o emoji. NADA MAIS.
+2. NÃO escreva explicações, NÃO inclua links, NENHUM preço e NENHUM nome de produto.
+3. NÃO use a frase "Tá num preço top!". Ela está proibida.
+4. Exemplo de saída esperada: ${exemploSorteado} 🔥`;
+
+            const userPrompt = `Gere uma frase de abertura variada para divulgar o produto: ${oferta.titulo}`;
+
+            const response = await ollama.chat({
+                model: OLLAMA_MODEL,
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userPrompt }
+                ],
+                options: {
+                    temperature: 0.85,
+                    num_predict: 25
+                }
+            });
+
+            if (response?.message?.content) {
+                fraseAbertura = response.message.content.trim().replace(/^["'\s]+|["'\s]+$/g, '');
+            }
+        } catch (error) {
+            console.warn('⚠️ Ollama indisponível. Usando frase alternativa do JS.');
+            logError('ia.gerarMensagem', error);
+        }
+    }
+
+    // Se a IA falhar, estiver em cooldown ou retornar vazio, sorteia uma frase em JS
+    if (!fraseAbertura) {
+        const fallbacks = [
+            '🔥 *OFERTA IMPERDÍVEL!*',
+            '💥 *OLHA ESSA PROMOÇÃO!*',
+            '⚡ *BAIXOU O PREÇO!*',
+            '🚀 *DESTAQUE DO DIA!*',
+            '👀 *ACHADINHO EM CONTA!*'
+        ];
+        fraseAbertura = fallbacks[Math.floor(Math.random() * fallbacks.length)];
+    }
+
+    // Montagem 100% segura via código (garante que nada do produto seja cortado)
+    let msg = `${fraseAbertura}\n\n`;
+    msg += `📦 *${oferta.titulo}*\n`;
+    if (oferta.precoDe) msg += `De: ~R$ ${oferta.precoDe}~\n`;
+    msg += `Por apenas: *R$ ${oferta.precoPor}*\n`;
+    if (oferta.cupom) msg += `🎟️ Cupom: *${oferta.cupom}*\n`;
+    msg += `\n👉 Compre agora: ${oferta.link}`;
+
     return msg;
 }
 
@@ -278,10 +360,8 @@ async function iniciarLoopDeEnvio() {
                 const oferta = ofertasQueue.shift();
                 console.log(`[${getHorarioAtual()}] 📤 Processando oferta com IA: "${oferta.titulo}"`);
 
-                // Gera o texto personalizado via IA Local
                 const mensagem = await gerarMensagemComIA(oferta);
 
-                // Notifica status online
                 await client.sendPresenceAvailable().catch(() => {});
                 await new Promise(resolve => setTimeout(resolve, 2000));
 
@@ -296,7 +376,6 @@ async function iniciarLoopDeEnvio() {
 
                 console.log(`[${getHorarioAtual()}] ✅ Oferta processada. Restantes na fila: ${ofertasQueue.length}`);
 
-                // Intervalo seguro aleatório (ex: entre 3 e 6 minutos)
                 const delayMs = getTempoAleatorioMs(3, 6);
                 console.log(`⏳ Próximo disparo em ${(delayMs / 1000 / 60).toFixed(1)} minutos...\n`);
 
@@ -383,7 +462,7 @@ app.post('/set-grupo', checkValidBody, (req, res) => {
     }
 });
 
-app.post('/ofertas', checkValidBody, (req, res) => {
+app.post('/ofertas', checkValidBody, async (req, res) => {
     try {
         const { titulo, precoPor, precoDe, cupom, link } = req.body;
 
@@ -392,17 +471,31 @@ app.post('/ofertas', checkValidBody, (req, res) => {
         }
 
         const novaOferta = { titulo, precoPor, precoDe, cupom, link, adicionadoEm: new Date() };
+
+        const analise = await curarOfertaComIA(novaOferta);
+
+        if (!analise.aprovar) {
+            console.log(`🗑️ [Curadoria IA] Oferta descartada: "${titulo}" | Motivo: ${analise.motivo}`);
+            return res.json({
+                success: false,
+                descartado: true,
+                message: 'A oferta foi descartada pelo filtro inteligente da IA.',
+                motivo: analise.motivo
+            });
+        }
+
         ofertasQueue.push(novaOferta);
+        console.log(`✨ [Curadoria IA] Oferta aprovada: "${titulo}" | Motivo: ${analise.motivo}`);
 
         return res.json({
             success: true,
-            message: 'Oferta adicionada à fila com sucesso!',
+            message: 'Oferta avaliada, aprovada e adicionada à fila com sucesso!',
             posicaoNaFila: ofertasQueue.length,
             oferta: novaOferta
         });
     } catch (error) {
         logError('route.ofertas', error, { body: req.body });
-        return res.status(500).json(buildErrorPayload('Erro ao adicionar oferta.', error));
+        return res.status(500).json(buildErrorPayload('Erro ao processar oferta.', error));
     }
 });
 

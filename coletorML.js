@@ -6,6 +6,12 @@ const cheerio = require('cheerio');
 // ==========================================
 const MEU_TAG_AFILIADO = process.env.ML_AFFILIATE_TAG || 'vean5438384';
 const API_LOCAL_URL = 'http://127.0.0.1:3000/ofertas';
+const QTD_PRODUTOS_POR_BUSCA = 30; // Limite total de produtos por rodada
+const PRODUTOS_POR_CATEGORIA = 2;  // Troca de categoria a cada 2 produtos
+const INTERVALO_MINUTOS = 30;     // Tempo entre cada verificação automática
+
+// Conjunto para controle de duplicados em memória (evita reenviar o mesmo item)
+const linksEnviados = new Set();
 
 // Páginas de ofertas/promoções do Mercado Livre
 const URLS_OFERTAS = [
@@ -24,15 +30,28 @@ function gerarLinkAfiliado(permalink) {
 }
 
 /**
- * Raspagem de dados diretamente da página de Ofertas do Mercado Livre
+ * Função utilitária de delay
  */
-async function buscarOfertasML() {
-    console.log('🔎 [Coletor ML] Raspando ofertas do Mercado Livre...');
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-    const urlAlvo = URLS_OFERTAS[Math.floor(Math.random() * URLS_OFERTAS.length)];
+/**
+ * Embaralha um array de forma aleatória (Algoritmo Fisher-Yates)
+ */
+function embaralharArray(array) {
+    const arr = [...array];
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+}
 
+/**
+ * Raspagem de uma URL específica do ML
+ */
+async function rasparCategoria(url) {
     try {
-        const response = await axios.get(urlAlvo, {
+        const response = await axios.get(url, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
                 'Accept-Language': 'pt-BR,pt;q=0.9',
@@ -41,19 +60,17 @@ async function buscarOfertasML() {
         });
 
         const $ = cheerio.load(response.data);
-        const produtos = [];
+        const produtosRaspados = [];
 
-        // Varre os cards de produtos da página de Ofertas
         $('.promotions_promotion-item, .promotion-item, .poly-card').each((index, element) => {
             const titulo = $(element).find('.promotions_promotion-item__title, .poly-component__title, .promotion-item__title').text().trim();
             const link = $(element).find('a').attr('href');
             
-            // Pega os preços
             const precoPorText = $(element).find('.andromeda-price__fraction, .poly-price__current .andes-money-amount__fraction').first().text().trim();
             const precoDeText = $(element).find('.andes-money-amount--previous .andes-money-amount__fraction').first().text().trim();
 
             if (titulo && link && precoPorText) {
-                produtos.push({
+                produtosRaspados.push({
                     titulo,
                     link,
                     precoPor: precoPorText,
@@ -62,14 +79,57 @@ async function buscarOfertasML() {
             }
         });
 
-        if (produtos.length === 0) {
-            console.log('⚠️ [Coletor ML] Nenhum card de produto capturado nesta tentativa. Tentando novamente...');
-            return;
+        return produtosRaspados;
+    } catch (error) {
+        console.error(`❌ [Coletor ML] Erro ao raspar URL (${url}):`, error.message);
+        return [];
+    }
+}
+
+/**
+ * Raspagem e processamento rotativo de ofertas do Mercado Livre
+ */
+async function buscarOfertasML() {
+    console.log(`\n🔎 [Coletor ML] Coletando até ${QTD_PRODUTOS_POR_BUSCA} ofertas (alternando a cada ${PRODUTOS_POR_CATEGORIA} produtos)...`);
+
+    const loteParaEnviar = [];
+    const categoriasDisponiveis = embaralharArray(URLS_OFERTAS);
+    let indexCategoria = 0;
+
+    // Loop de coleta alternada por categoria
+    while (loteParaEnviar.length < QTD_PRODUTOS_POR_BUSCA && categoriasDisponiveis.length > 0) {
+        const urlAlvo = categoriasDisponiveis[indexCategoria % categoriasDisponiveis.length];
+        
+        const produtosRaspados = await rasparCategoria(urlAlvo);
+        const produtosNovos = embaralharArray(produtosRaspados).filter(
+            p => !linksEnviados.has(p.link) && !loteParaEnviar.some(item => item.link === p.link)
+        );
+
+        // Seleciona até 2 produtos desta categoria
+        const selecionados = produtosNovos.slice(0, PRODUTOS_POR_CATEGORIA);
+
+        if (selecionados.length > 0) {
+            loteParaEnviar.push(...selecionados);
+            indexCategoria++;
+        } else {
+            // Se a categoria não tem mais produtos novos, remove da lista da rodada
+            categoriasDisponiveis.splice(indexCategoria % categoriasDisponiveis.length, 1);
         }
 
-        // Escolhe um produto aleatório da lista raspada
-        const produto = produtos[Math.floor(Math.random() * produtos.length)];
+        // Aguarda 1s entre as requisições das páginas de ofertas
+        await delay(1000);
+    }
 
+    if (loteParaEnviar.length === 0) {
+        console.log('⚠️ [Coletor ML] Nenhum produto novo encontrado nesta tentativa.');
+        return;
+    }
+
+    console.log(`📦 [Coletor ML] ${loteParaEnviar.length} novos produtos selecionados para envio.\n`);
+
+    let enviadosComSucesso = 0;
+
+    for (const produto of loteParaEnviar) {
         const precoPorNum = parseFloat(produto.precoPor.replace(/\./g, '').replace(',', '.'));
         const precoDeNum = produto.precoDe 
             ? parseFloat(produto.precoDe.replace(/\./g, '').replace(',', '.'))
@@ -83,20 +143,57 @@ async function buscarOfertasML() {
             link: gerarLinkAfiliado(produto.link)
         };
 
-        console.log(`✨ [Coletor ML] Oferta capturada: "${payloadOferta.titulo}" - R$ ${payloadOferta.precoPor}`);
+        try {
+            // Marca no histórico de enviados
+            linksEnviados.add(produto.link);
 
-        // Envia para o servidor local
-        await axios.post(API_LOCAL_URL, payloadOferta);
-        console.log(`✅ [Coletor ML] Oferta enviada para a fila do bot com sucesso!\n`);
+            console.log(`➡️ Enviando (${enviadosComSucesso + 1}/${loteParaEnviar.length}): "${payloadOferta.titulo}"`);
+            
+            const res = await axios.post(API_LOCAL_URL, payloadOferta);
+            
+            if (res.data?.descartado) {
+                console.log(`   🗑️ Descartado pela IA: ${res.data.motivo}`);
+            } else {
+                console.log(`   ✅ Aprovado e enfileirado!`);
+            }
 
-    } catch (error) {
-        console.error('❌ [Coletor ML] Erro durante a raspagem:', error.message);
+            enviadosComSucesso++;
+
+            // Pausa de 1,5s entre requisições para a API processar com calma
+            await delay(1500);
+
+        } catch (err) {
+            console.error(`   ❌ Erro ao enviar item "${produto.titulo}":`, err.message);
+        }
     }
+
+    // Limpa a memória se o histórico ficar muito grande (mais de 300 itens)
+    if (linksEnviados.size > 300) {
+        linksEnviados.clear();
+    }
+
+    console.log(`\n✨ [Coletor ML] Finalizado envio do lote. Total processado: ${enviadosComSucesso}`);
+}
+
+/**
+ * Inicializador e Agendador Continuo
+ */
+function iniciarColetorAutomatico() {
+    console.log(`🚀 [Coletor ML] Iniciado em modo contínuo!`);
+    console.log(`⏱️ Rodará a cada ${INTERVALO_MINUTOS} minutos buscando ${QTD_PRODUTOS_POR_BUSCA} produtos por vez.`);
+
+    // Execução imediata ao iniciar
+    buscarOfertasML();
+
+    // Loop com setInterval
+    setInterval(() => {
+        buscarOfertasML();
+    }, INTERVALO_MINUTOS * 60 * 1000);
 }
 
 // Permite executar via terminal
 if (require.main === module) {
-    buscarOfertasML();
+    iniciarColetorAutomatico();
 }
 
-module.exports = { buscarOfertasML };
+module.exports = { buscarOfertasML, iniciarColetorAutomatico };
