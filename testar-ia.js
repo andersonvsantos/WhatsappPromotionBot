@@ -1,56 +1,10 @@
 const fs = require('fs');
 const path = require('path');
-const { GoogleGenAI } = require('@google/genai');
+const { Ollama } = require('ollama');
 
-function carregarVariaveisDoEnv() {
-    const caminhos = [path.join(__dirname, '.env'), path.join(__dirname, '.env.local')];
+const OLLAMA_MODEL = 'llama3.2:3b';
 
-    for (const arquivo of caminhos) {
-        if (!fs.existsSync(arquivo)) continue;
-
-        const conteudo = fs.readFileSync(arquivo, 'utf8');
-        const variaveis = {};
-
-        for (const linha of conteudo.split(/\r?\n/)) {
-            const texto = linha.trim();
-            if (!texto || texto.startsWith('#')) continue;
-
-            const separador = texto.indexOf('=');
-            if (separador === -1) continue;
-
-            const chave = texto.slice(0, separador).trim();
-            let valor = texto.slice(separador + 1).trim();
-
-            if ((valor.startsWith('"') && valor.endsWith('"')) || (valor.startsWith("'") && valor.endsWith("'"))) {
-                valor = valor.slice(1, -1);
-            }
-
-            variaveis[chave] = valor;
-        }
-
-        return { variaveis, arquivo };
-    }
-
-    return { variaveis: {}, arquivo: null };
-}
-
-function obterApiKey() {
-    const ambiente = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
-    if (ambiente.trim()) return ambiente.trim();
-
-    const { variaveis } = carregarVariaveisDoEnv();
-    const chaveArquivo = (variaveis.GEMINI_API_KEY || variaveis.GOOGLE_API_KEY || '').trim();
-    if (chaveArquivo) return chaveArquivo;
-
-    // Fallback temporário para testes locais
-    return 'AIzaSyCZ6v0cv2mRivwJ5m0_3p9QNUob1zLxE3M';
-}
-
-const apiKey = obterApiKey();
-console.log('🔑 Chave Gemini carregada:', apiKey ? 'Sim' : 'Não');
-
-// Inicializa o SDK com a API Key informada
-const ai = new GoogleGenAI({ apiKey });
+const ollama = new Ollama({ host: 'http://127.0.0.1:11434' });
 
 const ofertaExemplo = {
     titulo: "Smartphone Samsung Galaxy A36 5G 128GB",
@@ -61,47 +15,63 @@ const ofertaExemplo = {
 };
 
 async function testarIA() {
-    console.log("🚀 Testando geração de anúncio com o Gemini...\n");
+    console.log(`🚀 Gerando anúncio no formato estruturado com Ollama (${OLLAMA_MODEL})...\n`);
 
-    const prompt = `
-Você é um especialista em marketing, humorista e copywriter criativo de grupos de ofertas no WhatsApp.
-Crie um anúncio CURTO, ENGRAÇADO, DIVERTIDO e persuasivo para a oferta abaixo.
+    const systemPrompt = `Você é um divulgador de ofertas direto, moderno e objetivo no WhatsApp.
+Sua missão é criar uma mensagem no formato EXATO abaixo:
 
-Dados da Oferta:
+<Frase curta de destaque do produto> 🔥
+
+📱 *<Nome do Produto>*
+De: ~<Preço De>~
+Por apenas: *<Preço Por>*
+🎟️ Cupom: *<Cupom>*
+
+👉 Compre agora: <Link>
+
+Exemplos de chamadas para a primeira linha:
+- Celulares/Tech: Celular top de linha com excelente custo-benefício!
+- Roupas masculinas: Cueca extremamente confortável e de alta qualidade pra rapizada!
+- Roupas femininas: Topzinho confortável e estiloso pras meninas!
+- Cozinha/Casa: Potes reforçados e perfeitos pra levar sua marmita!
+
+REGRAS RÍGIDAS:
+1. Mantenha exatamente as quebras de linha mostradas no formato.
+2. Destaque o nome do produto, o Preço Por e o Cupom em *negrito*.
+3. Mostre o preço antigo com ~riscado~.
+4. Termine com o link. Não escreva nada depois dele.`;
+
+    const userPrompt = `Gere a oferta no formato estruturado:
 - Produto: ${ofertaExemplo.titulo}
 - Preço De: R$ ${ofertaExemplo.precoDe}
 - Preço Por: R$ ${ofertaExemplo.precoPor}
 - Cupom: ${ofertaExemplo.cupom}
-- Link: ${ofertaExemplo.link}
-
-Regras Obrigatórias:
-1. Comece com uma piada curta ou comentário bem-humorado sobre compras por impulso, falência, desculpas para o/a cônjuge ou humor cotidiano.
-2. Use a formatação nativa do WhatsApp (*negrito*, _itálico_, ~riscado~).
-3. Destaque o Preço Por em *negrito*.
-4. Se houver cupom, exiba-o com destaque em *negrito*.
-5. Mantenha obrigatoriamente o link original intacto no final da mensagem.
-6. Não adicione textos explicativos nem saudações genéricas fora da copy.
-`;
+- Link: ${ofertaExemplo.link}`;
 
     try {
-        if (!apiKey) {
-            throw new Error('Nenhuma API key do Gemini foi encontrada. Defina GEMINI_API_KEY ou GOOGLE_API_KEY no ambiente ou em um arquivo .env.');
-        }
-
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.0-flash',
-            contents: prompt
+        const response = await ollama.chat({
+            model: OLLAMA_MODEL,
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt }
+            ],
+            options: {
+                temperature: 0.4, // Mantém a estrutura bem comportada e sem inventar moda
+                num_predict: 150
+            }
         });
 
-        console.log("================ MENSAGEM GERADA ================\n");
-        console.log(response.text);
-        console.log("\n=================================================");
+        if (response?.message?.content) {
+            const textoLimpo = response.message.content.trim().replace(/^"+|"+$/g, '');
+            
+            console.log("================ MENSAGEM GERADA ================\n");
+            console.log(textoLimpo);
+            console.log("\n=================================================");
+        }
     } catch (error) {
-        console.error("❌ Erro ao chamar a API:", error.message || error);
+        console.error("❌ Erro ao chamar o Ollama:", error.message || error);
     }
 }
-
-module.exports = { carregarVariaveisDoEnv, obterApiKey, testarIA };
 
 if (require.main === module) {
     testarIA();

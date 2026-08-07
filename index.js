@@ -4,14 +4,14 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const express = require('express');
-const { GoogleGenAI } = require('@google/genai');
+const { Ollama } = require('ollama');
 
 // ==========================================
 // CONFIGURAÇÕES E ESTADO DA APLICAÇÃO
 // ==========================================
 const PORT = 3000;
-const GEMINI_MODEL = 'gemini-2.0-flash-lite';
-const GEMINI_COOLDOWN_MS = 60 * 1000;
+const OLLAMA_MODEL = 'llama3.2:3b'; // Model de 3B para chamadas coerentes e bem formatadas
+const IA_COOLDOWN_MS = 5 * 1000;
 let isReady = false;
 let targetGroupId = null;   // ID do grupo selecionado para ofertas
 let targetGroupName = null; // Nome do grupo selecionado para ofertas
@@ -19,7 +19,7 @@ let currentQrBase64 = null; // QR Code em Base64 para exibir na rota /qr
 let server = null;
 let shuttingDown = false;
 let loopStopRequested = false;
-let lastGeminiCallAt = 0;
+let lastIACallAt = 0;
 
 function carregarVariaveisDoEnv() {
     const arquivoEnv = path.join(__dirname, '.env');
@@ -46,14 +46,8 @@ function carregarVariaveisDoEnv() {
 
 carregarVariaveisDoEnv();
 
-function obterApiKeyGemini() {
-    return (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '').trim();
-}
-
-const geminiApiKey = obterApiKeyGemini();
-console.log(`🔑 Gemini API Key carregada: ${geminiApiKey ? 'Sim' : 'Não'}`);
-
-const ai = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null;
+// Instancia o cliente do Ollama conectando à instância local
+const ollama = new Ollama({ host: 'http://127.0.0.1:11434' });
 
 // Fila em memória para armazenar as ofertas pendentes
 const ofertasQueue = [];
@@ -150,60 +144,69 @@ function eHorarioPermitido() {
 }
 
 /**
- * Gera um texto engraçado e variado para a oferta utilizando a API do Gemini
+ * Gera uma chamada focada em qualidade e formata a oferta via Ollama (Local)
  */
 async function gerarMensagemComIA(oferta) {
-    if (!geminiApiKey || !ai) {
-        console.log('⚠️ Gemini não configurado. Usando layout padrão.');
-        return gerarLayoutPadrao(oferta);
-    }
-
     const now = Date.now();
-    if (now - lastGeminiCallAt < GEMINI_COOLDOWN_MS) {
-        console.log('⏱️ Aguardando cooldown do Gemini para evitar quota. Usando layout padrão.');
+    if (now - lastIACallAt < IA_COOLDOWN_MS) {
+        console.log('⏱️ Aguardando cooldown da IA local. Usando layout padrão.');
         return gerarLayoutPadrao(oferta);
     }
 
     try {
-        lastGeminiCallAt = now;
+        lastIACallAt = now;
 
-        const prompt = `
-Você é um especialista em marketing, humorista e copywriter criativo de grupos de ofertas no WhatsApp.
-Crie um anúncio CURTO, ENGRAÇADO, DIVERTIDO e persuasivo para a oferta abaixo.
+        const systemPrompt = `Você é um divulgador de ofertas direto, moderno e objetivo no WhatsApp.
+Sua missão é criar uma mensagem no formato EXATO abaixo:
 
-Dados da Oferta:
+<Frase curta de destaque do produto> 🔥
+
+📱 *<Nome do Produto>*
+De: ~<Preço De>~
+Por apenas: *<Preço Por>*
+🎟️ Cupom: *<Cupom>*
+
+👉 Compre agora: <Link>
+
+Exemplos de chamadas para a primeira linha:
+- Celulares/Tech: Celular top de linha com excelente custo-benefício!
+- Roupas masculinas: Cueca extremamente confortável e de alta qualidade pra rapizada!
+- Roupas femininas: Topzinho confortável e estiloso pras meninas!
+- Cozinha/Casa: Potes reforçados e perfeitos pra levar sua marmita!
+
+REGRAS RÍGIDAS:
+1. Mantenha exatamente as quebras de linha mostradas no formato.
+2. Destaque o nome do produto, o Preço Por e o Cupom em *negrito*.
+3. Mostre o preço antigo com ~riscado~.
+4. Termine com o link. Não escreva nada depois dele.`;
+
+        const userPrompt = `Gere a oferta no formato estruturado:
 - Produto: ${oferta.titulo}
-- Preço De: ${oferta.precoDe ? 'R$ ' + oferta.precoDe : 'Não informado'}
+- Preço De: ${oferta.precoDe ? 'R$ ' + oferta.precoDe : ''}
 - Preço Por: R$ ${oferta.precoPor}
 - Cupom: ${oferta.cupom || 'Nenhum'}
-- Link: ${oferta.link}
+- Link: ${oferta.link}`;
 
-Regras Obrigatórias:
-1. Comece com uma piada curta ou comentário bem-humorado sobre compras por impulso, falência, desculpas para o/a cônjuge ou humor cotidiano.
-2. Use a formatação nativa do WhatsApp (*negrito*, _itálico_, ~riscado~).
-3. Destaque o Preço Por em *negrito*.
-4. Se houver cupom, exiba-o com destaque em *negrito*.
-5. Mantenha obrigatoriamente o link original intacto no final da mensagem.
-6. Não adicione textos explicativos nem saudações genéricas fora da copy.
-`;
-
-        const response = await ai.models.generateContent({
-            model: GEMINI_MODEL,
-            contents: prompt
+        const response = await ollama.chat({
+            model: OLLAMA_MODEL,
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt }
+            ],
+            options: {
+                temperature: 0.4,
+                num_predict: 150
+            }
         });
 
-        if (response && response.text) {
-            return response.text.trim();
+        if (response?.message?.content) {
+            return response.message.content.trim().replace(/^"+|"+$/g, '');
         }
 
         return gerarLayoutPadrao(oferta);
     } catch (error) {
-        const mensagemErro = error?.message || String(error);
-        if (/quota|rate limit|429|RESOURCE_EXHAUSTED|PERMISSION_DENIED|API key/i.test(mensagemErro)) {
-            console.warn('⚠️ Gemini indisponível no momento. Usando layout padrão.', mensagemErro);
-        } else {
-            logError('ia.gerarMensagem', error);
-        }
+        console.warn('⚠️ Ollama local indisponível ou desconectado. Usando layout padrão.');
+        logError('ia.gerarMensagem', error);
         return gerarLayoutPadrao(oferta);
     }
 }
@@ -239,7 +242,7 @@ async function iniciarLoopDeEnvio() {
                 const oferta = ofertasQueue.shift();
                 console.log(`[${getHorarioAtual()}] 📤 Processando oferta com IA: "${oferta.titulo}"`);
 
-                // Gera o texto personalizado via Gemini
+                // Gera o texto personalizado via IA Local
                 const mensagem = await gerarMensagemComIA(oferta);
 
                 // Notifica status online
@@ -309,7 +312,7 @@ app.get('/status', (req, res) => {
         grupoId: targetGroupId,
         grupoNome: targetGroupName || 'Não identificado',
         totalFila: ofertasQueue.length,
-        geminiConfigurado: Boolean(geminiApiKey)
+        modeloIa: OLLAMA_MODEL
     });
 });
 
