@@ -134,6 +134,11 @@ function carregarGruposDoEnv() {
 
 function withTimeout(promise, ms, fallbackValue) {
     let timeoutId;
+    const safePromise = promise.catch((error) => {
+        // Preserve rejection for callers while preventing unhandled rejections
+        throw error;
+    });
+
     const timeoutPromise = new Promise((resolve) => {
         timeoutId = setTimeout(() => {
             console.warn(`⏱️ Tempo limite de ${ms}ms excedido na chamada.`);
@@ -141,13 +146,145 @@ function withTimeout(promise, ms, fallbackValue) {
         }, ms);
     });
 
-    return Promise.race([
-        promise.then((res) => {
+    const race = Promise.race([
+        safePromise.then((res) => {
             clearTimeout(timeoutId);
             return res;
         }),
         timeoutPromise
     ]);
+
+    safePromise.catch(() => {});
+    return race;
+}
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function isDetachedFrameError(error) {
+    if (!error) return false;
+    const message = String(error.message || error).toLowerCase();
+    return message.includes('detached frame')
+        || message.includes('target closed')
+        || message.includes('execution context was destroyed');
+}
+
+async function waitForClientReady(timeoutMs = 30000) {
+    if (isReady) return true;
+
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            cleanup();
+            reject(new Error(`Esperando WhatsApp pronto por ${timeoutMs}ms excedido.`));
+        }, timeoutMs);
+
+        const onReady = () => {
+            cleanup();
+            resolve(true);
+        };
+
+        const onDisconnect = (reason) => {
+            cleanup();
+            reject(new Error(`WhatsApp desconectado durante recuperação: ${reason}`));
+        };
+
+        const onAuthFailure = (message) => {
+            cleanup();
+            reject(new Error(`Falha de autenticação durante recuperação: ${message}`));
+        };
+
+        const cleanup = () => {
+            clearTimeout(timer);
+            client.off('ready', onReady);
+            client.off('disconnected', onDisconnect);
+            client.off('auth_failure', onAuthFailure);
+        };
+
+        client.on('ready', onReady);
+        client.on('disconnected', onDisconnect);
+        client.on('auth_failure', onAuthFailure);
+    }).catch((err) => {
+        logError('waitForClientReady', err);
+        return false;
+    });
+}
+
+async function restartWhatsAppClient() {
+    console.log('🔁 Reiniciando client do WhatsApp para recuperação...');
+    isReady = false;
+
+    try {
+        await client.destroy().catch(() => {});
+    } catch (err) {
+        logError('client.destroy', err);
+    }
+
+    try {
+        await client.initialize();
+        return await waitForClientReady(30000);
+    } catch (err) {
+        logError('client.initialize', err);
+        return false;
+    }
+}
+
+async function recoverFromDetachedFrame(error) {
+    if (!error) return false;
+
+    console.error('🚨 Detectado erro de frame desanexado no Puppeteer. Iniciando rotina de recuperação...');
+
+    if (client.pupPage) {
+        try {
+            await client.pupPage.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+            await delay(2000);
+            return await waitForClientReady(20000);
+        } catch (reloadError) {
+            logError('puppeteer.reload', reloadError);
+        }
+    }
+
+    return await restartWhatsAppClient();
+}
+
+async function safeSendMessage(targetGroupId, oferta, mensagem) {
+    const maxRetries = 1;
+    let attempt = 0;
+
+    while (attempt <= maxRetries) {
+        try {
+            let enviadoComImagem = false;
+
+            if (oferta.imagemUrl) {
+                try {
+                    const media = await MessageMedia.fromUrl(oferta.imagemUrl, { unsafeMime: true });
+                    await client.sendMessage(targetGroupId, media, { caption: mensagem });
+                    console.log(`[${getHorarioAtual()}] 🖼️ Oferta com imagem enviada para ${targetGroupId}`);
+                    enviadoComImagem = true;
+                } catch (imgError) {
+                    console.warn(`⚠️ Falha ao carregar mídia (${oferta.imagemUrl}). Enviando apenas texto...`, imgError.message);
+                    if (isDetachedFrameError(imgError)) {
+                        throw imgError;
+                    }
+                }
+            }
+
+            if (!enviadoComImagem) {
+                await client.sendMessage(targetGroupId, mensagem, { linkPreview: true });
+                console.log(`[${getHorarioAtual()}] ✅ Oferta em texto enviada para ${targetGroupId}`);
+            }
+
+            return;
+        } catch (error) {
+            if (isDetachedFrameError(error) && attempt < maxRetries) {
+                attempt += 1;
+                const recovered = await recoverFromDetachedFrame(error);
+                if (recovered) {
+                    console.log(`🔄 Reenviando para ${targetGroupId} após recuperação (${attempt}/${maxRetries})...`);
+                    continue;
+                }
+            }
+            throw error;
+        }
+    }
 }
 
 carregarVariaveisDoEnv();
@@ -180,7 +317,7 @@ const client = new Client({
 // FUNÇÕES DE SUPORTE E IA
 // ==========================================
 
-function getTempoAleatorioMs(minMinutes = 3, maxMinutes = 6) {
+function getTempoAleatorioMs(minMinutes = 2, maxMinutes = 4) {
     const minMs = minMinutes * 60 * 1000;
     const maxMs = maxMinutes * 60 * 1000;
     return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
@@ -360,42 +497,16 @@ async function iniciarLoopDeEnvio() {
 
                 for (const targetGroupId of targetGroupIds) {
                     try {
-                        let enviadoComImagem = false;
-
-                        // Tenta baixar e enviar a imagem se houver uma URL disponível
-                        if (oferta.imagemUrl) {
-                            try {
-                                const media = await MessageMedia.fromUrl(oferta.imagemUrl, { unsafeMime: true });
-                                await client.sendMessage(targetGroupId, media, { caption: mensagem });
-                                enviadoComImagem = true;
-                                console.log(`[${getHorarioAtual()}] 🖼️ Oferta com imagem enviada para ${targetGroupId}`);
-                            } catch (imgError) {
-                                console.warn(`⚠️ Falha ao carregar mídia (${oferta.imagemUrl}). Enviando apenas texto...`, imgError.message);
-                            }
-                        }
-
-                        // Fallback: se não tiver imagem ou falhar o envio da mídia, envia texto puro
-                        if (!enviadoComImagem) {
-                            await client.sendMessage(targetGroupId, mensagem, { linkPreview: true });
-                            console.log(`[${getHorarioAtual()}] ✅ Oferta em texto enviada para ${targetGroupId}`);
-                        }
-
+                        await safeSendMessage(targetGroupId, oferta, mensagem);
                     } catch (error) {
                         console.warn(`⚠️ Falha ao enviar para ${targetGroupId}:`, error.message || error);
-                        if (error.message && error.message.includes('detached Frame')) {
-                            console.error('🚨 Detectado erro de frame desanexado no Puppeteer. Reiniciando a página...');
-                            try {
-                                if (client.pupPage) await client.pupPage.reload();
-                            } catch (e) {
-                                logError('puppeteer.reload', e);
-                            }
-                        }
+                        logError('send.oferta', error, { targetGroupId, oferta: oferta.titulo });
                     }
                 }
 
                 console.log(`[${getHorarioAtual()}] ✅ Oferta processada. Restantes na fila: ${ofertasQueue.length}`);
 
-                const delayMs = getTempoAleatorioMs(3, 6);
+                const delayMs = getTempoAleatorioMs(2, 4);
                 console.log(`⏳ Próximo disparo em ${(delayMs / 1000 / 60).toFixed(1)} minutos...\n`);
 
                 await new Promise(resolve => setTimeout(resolve, delayMs));
