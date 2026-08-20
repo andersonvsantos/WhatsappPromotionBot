@@ -33,6 +33,10 @@ function formatErrorForLog(context, error, extra = {}) {
         timestamp: new Date().toISOString(),
         message: normalizedError.message,
         stack: normalizedError.stack || null,
+        error: {
+            message: normalizedError.message,
+            stack: normalizedError.stack || null
+        },
         ...extra
     };
 }
@@ -68,6 +72,21 @@ function isChatTargetCompatible(chatOrId) {
     }
 
     return false;
+}
+
+function isNewsletterTarget(chatOrId) {
+    if (typeof chatOrId === 'string') {
+        return chatOrId.trim().endsWith('@newsletter');
+    }
+
+    return Boolean(chatOrId?.isNewsletter);
+}
+
+function isMessageSendConfirmed(targetId, sentMessage) {
+    if (!sentMessage) return false;
+    if (!isNewsletterTarget(targetId)) return true;
+
+    return Boolean(sentMessage.serverId || sentMessage._data?.serverId);
 }
 
 function normalizeTargetGroupIds(value) {
@@ -256,7 +275,13 @@ async function safeSendMessage(targetGroupId, oferta, mensagem) {
             if (oferta.imagemUrl) {
                 try {
                     const media = await MessageMedia.fromUrl(oferta.imagemUrl, { unsafeMime: true });
-                    await client.sendMessage(targetGroupId, media, { caption: mensagem });
+                    const sentMessage = await client.sendMessage(targetGroupId, media, {
+                        caption: mensagem,
+                        waitUntilMsgSent: true
+                    });
+                    if (!isMessageSendConfirmed(targetGroupId, sentMessage)) {
+                        throw new Error('O WhatsApp não confirmou a publicação da mídia no canal.');
+                    }
                     console.log(`[${getHorarioAtual()}] 🖼️ Oferta com imagem enviada para ${targetGroupId}`);
                     enviadoComImagem = true;
                 } catch (imgError) {
@@ -268,7 +293,13 @@ async function safeSendMessage(targetGroupId, oferta, mensagem) {
             }
 
             if (!enviadoComImagem) {
-                await client.sendMessage(targetGroupId, mensagem, { linkPreview: true });
+                const sentMessage = await client.sendMessage(targetGroupId, mensagem, {
+                    linkPreview: true,
+                    waitUntilMsgSent: true
+                });
+                if (!isMessageSendConfirmed(targetGroupId, sentMessage)) {
+                    throw new Error('O WhatsApp não confirmou a publicação da mensagem no canal.');
+                }
                 console.log(`[${getHorarioAtual()}] ✅ Oferta em texto enviada para ${targetGroupId}`);
             }
 
@@ -805,6 +836,8 @@ module.exports = {
     buildErrorPayload,
     formatErrorForLog,
     isChatTargetCompatible,
+    isNewsletterTarget,
+    isMessageSendConfirmed,
     normalizeTargetGroupIds,
     mergeTargetGroupIds
 };

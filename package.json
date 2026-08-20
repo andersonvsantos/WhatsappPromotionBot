@@ -21,6 +21,6 @@
     "puppeteer": "^25.5.0",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "github:pedroslopez/whatsapp-web.js#main"
+    "whatsapp-web.js": "github:wwebjs/whatsapp-web.js#e8287c236c13101c356c59c8fdf7e44229860741"
   }
 }
